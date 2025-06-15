@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+
+# @describe MoneroSMS API client for sending SMS messages
+# @arg command "Command to run (send, balance, price, generate)" [string]
+# @arg to "Phone number to send message to (required for send)" [string]
+# @arg message "Message content to send (required for send)" [string]
+# @option -t --token "MoneroSMS API token (can also use MONERO_SMS_TOKEN env var)" [string]
+# @option -f --auth-file "Auth file path" [string] @default "monerosms-auth"
+# @option -u --url "Base URL for API" [string] @default "https://api.monerosms.com/"
+# @option --tor-port "Tor SOCKS proxy port (enables Tor mode)" [int]
+# @flag   --transparent-tor "Use Tor without SOCKS proxy"
+# @flag   -j --json "Output raw JSON instead of formatted results"
+# @flag   -q --quiet "Suppress colored output"
+# @meta require-tools curl,jq
+# @meta version 1.0.0
+
+eval "$(argc --argc-eval "$0" "$@")"
+
+VERSION="1.0.0"
+
+setup_colors() {
+  if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+  fi
+}
+setup_colors
+
+setup_connection() {
+  if [ -n "$argc_tor_port" ] || [ -n "$MONERO_SMS_TOR" ]; then
+    tor_port="${argc_tor_port:-$MONERO_SMS_TOR}"
+    if [ -n "$tor_port" ]; then
+      base_url="http://api.xmr4smsoncunkfgfjr6xmxl57afsmuu6rg2bwuysbgg4wdtoawamwxad.onion/"
+      if [ "$argc_transparent_tor" != 1 ] && [ -z "$MONERO_SMS_TRANSPARENT_TOR" ]; then
+        proxy_args="--socks4a 127.0.0.1:${tor_port}"
+      fi
+    fi
+  else
+    base_url="${argc_url}"
+  fi
+}
+
+get_token() {
+  if [ -n "$argc_token" ]; then
+    echo "$argc_token"
+  elif [ -n "$MONERO_SMS_TOKEN" ]; then
+    echo "$MONERO_SMS_TOKEN"
+  elif [ -f "$argc_auth_file" ]; then
+    cat "$argc_auth_file"
+  else
+    return 1
+  fi
+}
+
+generate_auth() {
+  printf "${bold}MoneroSMS Auth File Generator${reset}\n\n"
+  printf "Enter your MoneroSMS API token: "
+  read -s token
+  printf "\n"
+
+  if [ -z "$token" ]; then
+    printf "${red}Error:${reset} No token provided\n" >&2
+    exit 1
+  fi
+
+  echo "$token" > "$argc_auth_file"
+  printf "${green}Success:${reset} Token saved to ${cyan}%s${reset}\n" "$argc_auth_file"
+  printf "You can now use MoneroSMS commands without specifying the token\n"
+}
+
+make_request() {
+  local endpoint="$1"
+  local method="${2:-GET}"
+  local data="$3"
+  local token="$4"
+
+  local url="${base_url}${endpoint}"
+  local curl_args="-s"
+
+  [ -n "$proxy_args" ] && curl_args="$curl_args $proxy_args"
+
+  [ -n "$token" ] && curl_args="$curl_args -H 'Authorization: Bearer $token'"
+
+  if [ "$method" = "POST" ]; then
+    curl_args="$curl_args -X POST"
+    [ -n "$data" ] && curl_args="$curl_args -d '$data'"
+  fi
+
+  local response=$(eval "curl $curl_args '$url'")
+
+  if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+    error_msg=$(echo "$response" | jq -r '.error')
+    printf "${red}Error:${reset} API returned: ${red}%s${reset}\n" "$error_msg" >&2
+    exit 1
+  fi
+
+  echo "$response"
+}
+
+print_kv() {
+  printf "${bold}%s:${reset} %s\n" "$1" "$2"
+}
+
+print_section() {
+  printf "\n${bold}%s:${reset}\n" "$1"
+}
+
+show_help() {
+  echo "${bold}MoneroSMS API Client v${VERSION}${reset}"
+  echo ""
+  echo "${bold}Commands:${reset}"
+  echo "  ${cyan}send${reset}          Send SMS message"
+  echo "  ${cyan}balance${reset}       Check account balance"
+  echo "  ${cyan}price${reset}         Get SMS pricing"
+  echo "  ${cyan}generate${reset}      Generate auth file"
+  echo ""
+  echo "${bold}Examples:${reset}"
+  echo "  ${green}$(basename "$0") generate${reset}"
+  echo "  ${green}$(basename "$0") send +1234567890 \"Hello world\"${reset}"
+  echo "  ${green}$(basename "$0") balance${reset}"
+  echo "  ${green}$(basename "$0") price${reset}"
+  echo ""
+  echo "${bold}Authentication:${reset}"
+  echo "  The API token can be provided via:"
+  echo "  1. ${yellow}--token${reset} flag"
+  echo "  2. ${yellow}MONERO_SMS_TOKEN${reset} environment variable"
+  echo "  3. ${yellow}monerosms-auth${reset} file (use 'generate' command to create)"
+  echo ""
+  echo "${bold}Tor Support:${reset}"
+  echo "  ${yellow}--tor-port${reset}        Enable Tor via SOCKS proxy on specified port"
+  echo "  ${yellow}--transparent-tor${reset}  Use Tor without SOCKS proxy"
+  echo "  ${yellow}MONERO_SMS_TOR${reset}     Environment variable for Tor port"
+}
+
+format_send_result() {
+  local response="$1"
+  local success=$(echo "$response" | jq -r '.success // false')
+  local message_id=$(echo "$response" | jq -r '.message_id // "N/A"')
+  local cost=$(echo "$response" | jq -r '.cost // "N/A"')
+  local balance=$(echo "$response" | jq -r '.remaining_balance // "N/A"')
+
+  if [ "$success" = "true" ]; then
+    printf "${green}✓ Message sent successfully${reset}\n"
+    [ "$message_id" != "N/A" ] && print_kv "Message ID" "${blue}$message_id${reset}"
+    [ "$cost" != "N/A" ] && print_kv "Cost" "${yellow}$cost XMR${reset}"
+    [ "$balance" != "N/A" ] && print_kv "Remaining Balance" "${cyan}$balance XMR${reset}"
+  else
+    printf "${red}✗ Failed to send message${reset}\n"
+  fi
+}
+
+format_balance() {
+  local response="$1"
+  local balance=$(echo "$response" | jq -r '.balance // "N/A"')
+  local pending=$(echo "$response" | jq -r '.pending_balance // "N/A"')
+
+  print_kv "Balance" "${green}$balance XMR${reset}"
+  [ "$pending" != "N/A" ] && [ "$pending" != "0" ] && print_kv "Pending" "${yellow}$pending XMR${reset}"
+}
+
+format_price() {
+  local response="$1"
+
+  printf "${bold}SMS Pricing:${reset}\n"
+  echo "$response" | jq -r 'to_entries[] | "\(.key)|\(.value)"' | sort |
+    while IFS="|" read -r country price; do
+      printf "  ${cyan}%s:${reset} ${yellow}%s XMR${reset}\n" "$country" "$price"
+    done
+}
+
+setup_connection
+
+if [ -z "$argc_command" ]; then
+  show_help
+  exit 0
+fi
+
+case "$argc_command" in
+generate)
+  generate_auth
+  ;;
+
+send)
+  if [ -z "$argc_to" ] || [ -z "$argc_message" ]; then
+    printf "${red}Error:${reset} Both phone number and message are required for send command\n" >&2
+    printf "Usage: %s send <phone_number> <message>\n" "$(basename "$0")" >&2
+    exit 1
+  fi
+
+  token=$(get_token)
+  if [ -z "$token" ]; then
+    printf "${red}Error:${reset} No MoneroSMS API token found.\n" >&2
+    printf "Either:\n" >&2
+    printf "  1. Pass it with --token\n" >&2
+    printf "  2. Set MONERO_SMS_TOKEN environment variable\n" >&2
+    printf "  3. Generate auth file with: %s generate\n" "$(basename "$0")" >&2
+    exit 1
+  fi
+
+  encoded_message=$(printf '%s' "$argc_message" | jq -sRr @uri)
+  encoded_to=$(printf '%s' "$argc_to" | jq -sRr @uri)
+
+  data="to=${encoded_to}&message=${encoded_message}"
+  response=$(make_request "send" "POST" "$data" "$token")
+
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_send_result "$response"
+  ;;
+
+balance)
+  token=$(get_token)
+  if [ -z "$token" ]; then
+    printf "${red}Error:${reset} No MoneroSMS API token found.\n" >&2
+    printf "Generate auth file with: %s generate\n" "$(basename "$0")" >&2
+    exit 1
+  fi
+
+  response=$(make_request "balance" "GET" "" "$token")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_balance "$response"
+  ;;
+
+price)
+  response=$(make_request "price" "GET" "" "")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_price "$response"
+  ;;
+
+*)
+  printf "${red}Error:${reset} Unknown command: %s\n" "$argc_command" >&2
+  show_help
+  exit 1
+  ;;
+esac
